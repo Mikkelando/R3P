@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.append('./')
+from data_gen.utils.mp_feature_extractors.face_landmarker import read_video_to_frames
 import torch
 import torch.nn.functional as F
 import torchshow as ts
@@ -270,6 +271,7 @@ class GeneFace2Infer:
 
         # get the src_kp for torso model
         src_kp = self.face3d_helper.reconstruct_lm2d(src_id, src_exp, src_euler, src_trans) # [1, 68, 2]
+        tmp_src_kp = src_kp.detach().clone()
         src_kp = (src_kp-0.5) / 0.5 # rescale to -1~1
         sample['src_kp'] = torch.clamp(src_kp, -1, 1).repeat([t_x//2,1,1])
 
@@ -285,12 +287,58 @@ class GeneFace2Infer:
         else: # from file
             if inp['drv_pose_name'].endswith('.mp4'):
                 # extract coeff from video
-                drv_pose_coeff_dict = fit_3dmm_for_a_video(inp['drv_pose_name'], save=False)
+                import cv2
+                from sixdrepnet import SixDRepNet
+                model_ang = SixDRepNet()
+                video_path = inp['drv_pose_name']
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    raise ValueError(f"Не удалось открыть видео: {video_path}")
+                angles = []          
+                frame_idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    try:
+                        flipped_frame = cv2.flip(frame, 1)
+                        pitch, yaw, roll = model_ang.predict(flipped_frame)
+                        angles.append((pitch, yaw, roll)) 
+                    except Exception as e:
+                        print(f"Ошибка на кадре {frame_idx}: {e}")
+                    
+                    frame_idx += 1
+
+
+                cap.release()
+                print('frames worked: ', frame_idx)
+                    
+                angles = np.array(angles)
+                drv_pose_coeff_dict = fit_3dmm_for_a_video(inp['drv_pose_name'], save=False, angles=angles, src_trans=src_trans, src_kp=tmp_src_kp)
+                # drv_pose_coeff_dict = fit_3dmm_for_a_video(inp['drv_pose_name'], save=False)
             else:
                 # load from npy
                 drv_pose_coeff_dict = np.load(inp['drv_pose_name'], allow_pickle=True).tolist()
             print(f"| Extracted pose from {inp['drv_pose_name']}")
-            eulers = convert_to_tensor(drv_pose_coeff_dict['euler']).reshape([-1,3]).cuda()
+            print(len(drv_pose_coeff_dict['euler']))
+            print("\n\n\n LEN OF FRAMES :  ", len(read_video_to_frames(inp['drv_pose_name'])), '\n\n\n')
+            with open('old.txt', 'w') as file:
+                file.write(str(drv_pose_coeff_dict['euler']))
+
+            
+
+            with open('new.txt', 'w') as file:
+                file.write(str(angles))
+            angles =  angles * np.pi / 180
+            with open('new_morphed.txt', 'w') as file:
+                file.write(str(angles))
+            # np.savetxt('new_morphed.txt', angles)
+            # with open('my_new_angles.txt', 'w') as file:
+            #     file.write(str(angles))
+            # eulers = convert_to_tensor(drv_pose_coeff_dict['euler']).reshape([-1,3]).cuda()
+            eulers = convert_to_tensor(angles).reshape([-1,3]).cuda()
+
             trans = convert_to_tensor(drv_pose_coeff_dict['trans']).reshape([-1,3]).cuda()
             len_pose = len(eulers)
             index_lst = [mirror_index(i, len_pose) for i in range(t_x//2)]
@@ -317,8 +365,12 @@ class GeneFace2Infer:
         camera = smooth_camera_sequence(camera, kernel_size=camera_smo_ksize) # [T, 25]
         camera = torch.tensor(camera).cuda().float()
         sample['camera'] = camera
+        # import json
+        # with open("tmp_snample.json", "w", encoding="utf-8") as f:
+        #     json.dump(sample, f, ensure_ascii=False, indent=4)
 
         return sample
+    
 
     @torch.no_grad()
     def get_hubert(self, wav16k_name):

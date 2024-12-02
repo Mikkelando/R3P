@@ -135,7 +135,10 @@ def fit_3dmm_for_a_video(
     debug=False, 
     keypoint_mode='mediapipe',
     large_yaw_threshold=9999999.9,
-    save=True
+    save=True,
+    angles = None,
+    src_trans = None,
+    src_kp=None
 ) -> bool: # True: good, False: bad 
     assert video_name.endswith(".mp4"), "this function only support video as input"
     if id_mode == 'global':
@@ -155,7 +158,13 @@ def fit_3dmm_for_a_video(
     img_h, img_w = frames.shape[1], frames.shape[2]
     assert img_h == img_w
     num_frames = len(frames)
-
+    if angles is not None:
+        fixed_euler_angle = torch.tensor(angles, device="cuda")
+        fixed_euler_angle = fixed_euler_angle.squeeze(-1) 
+        # fixed_euler_angle[:, 1:3] *= -1
+        # fixed_euler_angle = torch.tensor(angles, dtype=torch.float32).to('cuda')  # Преобразование в тензор
+        # fixed_euler_angle = fixed_euler_angle.unsqueeze(-1) if fixed_euler_angle.ndim == 2 else fixed_euler_angle  
+        print(f'\n\n\n ANGLES SHAPE:  {fixed_euler_angle.shape} \n\n\n')
     if nerf: # single video
         lm_name = video_name.replace("/raw/", "/processed/").replace(".mp4","/lms_2d.npy")
     else:
@@ -178,6 +187,23 @@ def fit_3dmm_for_a_video(
     lms = lms[:, :468, :]
     lms = torch.FloatTensor(lms).cuda()
     lms[..., 1] = img_h - lms[..., 1] # flip the height axis
+
+    if src_kp is not None:
+        CHIN_INDEX_SRC = 8
+        CHIN_INDEX_DRV = 199
+
+    
+        src_chin = src_kp[0, CHIN_INDEX_SRC, :]  
+
+        
+        drv_chins = lms[:30, CHIN_INDEX_DRV, :2]  
+        drv_chin_mean = torch.mean(drv_chins, dim=0)  
+
+        
+        shift_vector = src_chin - drv_chin_mean  
+
+       
+        lms[..., :2] += shift_vector
 
     if keypoint_mode == 'mediapipe':
         # default
@@ -214,12 +240,20 @@ def fit_3dmm_for_a_video(
     else: raise NotImplementedError(f"id mode {id_mode} not supported! we only support global or finegrained.")
     exp_para = lms.new_zeros((num_frames, exp_dim), requires_grad=True)
     euler_angle = lms.new_zeros((num_frames, 3), requires_grad=True)
+    print(f'\n\n\n OLD ANGEL SHAPES:  {euler_angle.shape} \n\n\n')
+    if angles is not None:
+        euler_angle = fixed_euler_angle
     trans = lms.new_zeros((num_frames, 3), requires_grad=True)
 
-    set_requires_grad([id_para, exp_para, euler_angle, trans])
+    if angles is not None:
+        set_requires_grad([id_para, exp_para, euler_angle, trans])
+        optimizer_frame = torch.optim.Adam([euler_angle,trans], lr=.1)
+    else:
+        set_requires_grad([id_para, exp_para, euler_angle, trans])
+        optimizer_frame = torch.optim.Adam([euler_angle, trans], lr=.1)
 
     optimizer_idexp = torch.optim.Adam([id_para, exp_para], lr=.1)
-    optimizer_frame = torch.optim.Adam([euler_angle, trans], lr=.1)
+   
 
     # 其他参数初始化，先训练euler和trans
     for _ in range(200):
@@ -230,7 +264,19 @@ def fit_3dmm_for_a_video(
             proj_geo = face_model.compute_for_landmark_fit(
                 id_para, exp_para, euler_angle, trans)
         loss_lan = cal_lan_loss_fn(proj_geo[:, :, :2], lms.detach())
-        loss = loss_lan
+        # loss_lan = 0
+
+        face_center = torch.mean(lms[:, :, :2], dim=1)  
+        trans_diff = trans[:, :2] - face_center
+        loss_centering = torch.mean(torch.norm(trans_diff, dim=1))
+        with open('loss_centering_rough.txt', 'a') as file:
+            file.write(str(loss_centering)+'\n')
+        with open('euler_angle_rough.txt', 'a') as file:
+                file.write(str(cal_lap_loss(euler_angle))+'\n')
+        src_trans_loss = 0
+        if src_trans is not None:
+            src_trans_loss = torch.mean(torch.norm(trans -src_trans))
+        loss =  loss_lan + loss_centering *0.5+ src_trans_loss*0.5
         optimizer_frame.zero_grad()
         loss.backward()
         optimizer_frame.step()
@@ -254,7 +300,20 @@ def fit_3dmm_for_a_video(
             proj_geo[:, :, :2], lms.detach())
         # loss_lap = cal_lap_loss(proj_geo)
         # laplacian对euler影响不大，但是对trans的提升很大
-        loss_lap = cal_lap_loss(id_para) + cal_lap_loss(exp_para) + cal_lap_loss(euler_angle) * 0.3 + cal_lap_loss(trans) * 0.3
+
+
+        face_center = torch.mean(lms[:, :, :2], dim=1)  
+        trans_diff = trans[:, :2] - face_center
+        loss_centering = torch.mean(torch.norm(trans_diff, dim=1))
+
+        with open('loss_centering_rough_2.txt', 'a') as file:
+            file.write(str(loss_centering)+'\n')
+
+        src_trans_loss = 0
+        if src_trans is not None:
+            src_trans_loss = torch.mean(torch.norm(trans -src_trans))
+
+        loss_lap = cal_lap_loss(id_para) + cal_lap_loss(exp_para) + cal_lap_loss(euler_angle) * 0.3 + cal_lap_loss(trans) * 0.8 +  loss_centering * 0.8 
 
         loss_regid = torch.mean(id_para*id_para) # 正则化
         loss_regexp = torch.mean(exp_para * exp_para)
@@ -315,9 +374,14 @@ def fit_3dmm_for_a_video(
         sel_trans.data = trans[sel_ids].clone()
         
         if id_mode == 'global':
-            set_requires_grad([sel_exp_para, sel_euler_angle, sel_trans])
-            optimizer_cur_batch = torch.optim.Adam(
-                [sel_exp_para, sel_euler_angle, sel_trans], lr=0.005)
+            if angles is not None:
+                set_requires_grad([sel_exp_para, sel_euler_angle, sel_trans])
+                optimizer_cur_batch = torch.optim.Adam(
+                    [sel_exp_para,sel_euler_angle, sel_trans], lr=0.005)
+            else:
+                set_requires_grad([sel_exp_para, sel_euler_angle, sel_trans])
+                optimizer_cur_batch = torch.optim.Adam(
+                    [sel_exp_para, sel_euler_angle, sel_trans], lr=0.005)
         else:
             set_requires_grad([sel_id_para, sel_exp_para, sel_euler_angle, sel_trans])
             optimizer_cur_batch = torch.optim.Adam(
@@ -331,7 +395,13 @@ def fit_3dmm_for_a_video(
                 proj_geo[:, :, :2], lms[sel_ids].detach())
             
             # loss_lap = cal_lap_loss(proj_geo)
-            loss_lap = cal_lap_loss(sel_id_para) + cal_lap_loss(sel_exp_para) + cal_lap_loss(sel_euler_angle) * 0.3 + cal_lap_loss(sel_trans) * 0.3
+            face_center = torch.mean(lms[:, :, :2], dim=1)  
+            trans_diff = trans[:, :2] - face_center
+            loss_centering = torch.mean(torch.norm(trans_diff, dim=1))
+            with open('loss_centering_smooth.txt', 'a') as file:
+                file.write(str(loss_centering)+'\n')
+
+            loss_lap = cal_lap_loss(sel_id_para) + cal_lap_loss(sel_exp_para) + cal_lap_loss(sel_euler_angle) * 0.3 + cal_lap_loss(sel_trans) * 0.8 + loss_centering * 0.8
             loss_vel_id = cal_vel_loss(sel_id_para)
             loss_vel_exp = cal_vel_loss(sel_exp_para)
             log_dict = {
@@ -356,9 +426,18 @@ def fit_3dmm_for_a_video(
         exp_para[sel_ids].data = sel_exp_para.data.clone()
         euler_angle[sel_ids].data = sel_euler_angle.data.clone()
         trans[sel_ids].data = sel_trans.data.clone()
+        
+        #hard stuck
+        # trans = lms.new_zeros((num_frames, 3), requires_grad=True)
+        # trans = trans / 10
 
     coeff_dict = {'id': id_para.detach().cpu().numpy(), 'exp': exp_para.detach().cpu().numpy(),
                 'euler': euler_angle.detach().cpu().numpy(), 'trans': trans.detach().cpu().numpy()}
+    
+
+    
+
+
 
     # filter data by side-view pose    
     # bad_yaw = False
